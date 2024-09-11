@@ -14,6 +14,9 @@ import uuid
 
 import gradio as gr
 import requests
+import re
+import logging
+from e2b_code_interpreter import CodeInterpreter
 
 from fastchat.constants import (
     LOGDIR,
@@ -400,6 +403,82 @@ def is_limit_reached(model_name, ip):
         return None
 
 
+def extract_code_from_markdown(message):
+    # Regular expression to match code blocks
+    code_block_regex = r'```(?:\w+\n)?(.*?)```'
+    matches = re.findall(code_block_regex, message, re.DOTALL)
+    
+    if matches:
+        # Return the first code block found
+        return matches[0].strip()
+    else:
+        # If no code block is found, return the entire message
+        return message.strip()
+
+def render_result(result):
+    if result.png:
+        if isinstance(result.png, str):
+            img_str = result.png
+        else:
+            img_str = base64.b64encode(result.png).decode()
+        return f"<img src='data:image/png;base64,{img_str}'>"
+    elif result.jpeg:
+        if isinstance(result.jpeg, str):
+            img_str = result.jpeg
+        else:
+            img_str = base64.b64encode(result.jpeg).decode()
+        return f"<img src='data:image/jpeg;base64,{img_str}'>"
+    elif result.svg:
+        return result.svg
+    elif result.html:
+        return result.html
+    elif result.markdown:
+        return f"```markdown\n{result.markdown}\n```"
+    elif result.latex:
+        return f"```latex\n{result.latex}\n```"
+    elif result.json:
+        return f"```json\n{result.json}\n```"
+    elif result.javascript:
+        return result.javascript  # Return raw JavaScript
+    else:
+        return str(result)
+
+def run_code_interpreter(code):
+    with CodeInterpreter() as sandbox:
+        execution = sandbox.notebook.exec_cell(code)
+        std = dict(execution.logs)
+        stdout = "\n".join(std["stdout"])
+        stderr = "\n".join(std["stderr"])
+        output = ""
+        if stdout:
+            output += f"### Stdout:\n```\n{stdout}\n```\n\n"
+        if stderr:
+            output += f"### Stderr:\n```\n{stderr}\n```\n\n"
+        
+        results = []
+        js_code = ""
+        for result in execution.results:
+            rendered_result = render_result(result)
+            if result.javascript:
+                js_code += rendered_result + "\n"
+            else:
+                results.append(rendered_result)
+        return output, "\n".join(results), js_code
+
+def on_chat_click(state, evt: gr.SelectData):
+    if evt.value.endswith("<button style='background-color: #4CAF50; border: none; color: white; padding: 10px 24px; text-align: center; text-decoration: none; display: inline-block; font-size: 16px; margin: 4px 2px; cursor: pointer; border-radius: 12px;' onclick='runInSandbox()'>Run in Sandbox</button>"):
+            message = evt.value.replace("<button style='background-color: #4CAF50; border: none; color: white; padding: 10px 24px; text-align: center; text-decoration: none; display: inline-block; font-size: 16px; margin: 4px 2px; cursor: pointer; border-radius: 12px;' onclick='runInSandbox()'>Run in Sandbox</button>", "").strip()
+            code = extract_code_from_markdown(message)
+            if code:
+                output, results, js_code = run_code_interpreter(code)
+                
+                if output:
+                    return gr.Markdown(value=output, visible=True), gr.HTML(value=results, visible=True)
+                else:
+                    return gr.Markdown(value="", visible=False), gr.HTML(value=results, visible=True)
+            
+    return gr.Markdown(visible=False), gr.HTML(visible=False)
+
 def bot_response(
     state,
     temperature,
@@ -516,7 +595,6 @@ def bot_response(
             if data["error_code"] == 0:
                 output = data["text"].strip()
                 conv.update_last_message(output + "▌")
-                # conv.update_last_message(output + html_code)
                 yield (state, state.to_gradio_chatbot()) + (disable_btn,) * 5
             else:
                 output = data["text"] + f"\n\n(error_code: {data['error_code']})"
@@ -531,6 +609,13 @@ def bot_response(
                 return
         output = data["text"].strip()
         conv.update_last_message(output)
+        
+        # Add a "Run in Sandbox" button to the last message if code is detected
+        last_message = state.conv.messages[-1]
+        if "```" in last_message[1]:
+            if not last_message[1].endswith("\n\n<button style='background-color: #4CAF50; border: none; color: white; padding: 10px 24px; text-align: center; text-decoration: none; display: inline-block; font-size: 16px; margin: 4px 2px; cursor: pointer; border-radius: 12px;' onclick='runInSandbox()'>Run in Sandbox</button>"):
+                last_message[1] += "\n\n<button style='background-color: #4CAF50; border: none; color: white; padding: 10px 24px; text-align: center; text-decoration: none; display: inline-block; font-size: 16px; margin: 4px 2px; cursor: pointer; border-radius: 12px;' onclick='runInSandbox()'>Run in Sandbox</button>"
+        
         yield (state, state.to_gradio_chatbot()) + (enable_btn,) * 5
     except requests.exceptions.RequestException as e:
         conv.update_last_message(
@@ -587,7 +672,6 @@ def bot_response(
         }
         fout.write(json.dumps(data) + "\n")
     get_remote_logger().log(data)
-
 
 block_css = """
 .prose {
@@ -851,6 +935,12 @@ def build_single_model_ui(models, add_promotion_links=False):
             height=650,
             show_copy_button=True,
         )
+
+        # Add containers for the sandbox output and JavaScript
+        with gr.Row():
+            sandbox_output = gr.Markdown(visible=False)
+            sandbox_render = gr.HTML(visible=False)
+
     with gr.Row():
         textbox = gr.Textbox(
             show_label=False,
@@ -940,7 +1030,9 @@ def build_single_model_ui(models, add_promotion_links=False):
         [state, chatbot] + btn_list,
     )
 
-    return [state, model_selector]
+    chatbot.select(on_chat_click, [state], outputs=[sandbox_output, sandbox_render])
+
+    return [state, model_selector, sandbox_output, sandbox_render]
 
 
 def build_demo(models):
@@ -951,7 +1043,7 @@ def build_demo(models):
     ) as demo:
         url_params = gr.JSON(visible=False)
 
-        state, model_selector = build_single_model_ui(models)
+        state, model_selector, sandbox_output, sandbox_render = build_single_model_ui(models)
 
         if args.model_list_mode not in ["once", "reload"]:
             raise ValueError(f"Unknown model list mode: {args.model_list_mode}")
@@ -970,6 +1062,19 @@ def build_demo(models):
             ],
             js=load_js,
         )
+
+        # Add a custom JavaScript function to handle sandbox execution
+        sandbox_js_code = """
+        function executeSandboxCode(code) {
+            // This function will be called when sandbox code needs to be executed
+            try {
+                eval(code);
+            } catch (error) {
+                console.error('Error executing sandbox code:', error);
+            }
+        }
+        """
+        demo.js = sandbox_js_code
 
     return demo
 
